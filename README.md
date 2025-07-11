@@ -1,2 +1,2 @@
 # cloud-resume-challenge
-Repository for 
+Multi-cloud infrastructure for cloud resume challenge - AWS and GCP deployment with CI/CD
