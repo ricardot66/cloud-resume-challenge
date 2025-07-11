@@ -91,7 +91,7 @@ resource "aws_cloudfront_distribution" "resume_distribution" {
       }
     }
 
-    viewer_protocol_policy = "allow-all"  # Matches your current setup
+    viewer_protocol_policy = "allow-all" # Matches your current setup
     min_ttl                = 0
     default_ttl            = 86400
     max_ttl                = 31536000
@@ -104,7 +104,7 @@ resource "aws_cloudfront_distribution" "resume_distribution" {
     }
   }
 
-viewer_certificate {
+  viewer_certificate {
     acm_certificate_arn      = "arn:aws:acm:us-east-1:503561451261:certificate/1f7f399f-ca8d-4d6e-aaf0-30b73fcf210c"
     ssl_support_method       = "sni-only"
     minimum_protocol_version = "TLSv1.2_2021"
@@ -118,13 +118,13 @@ viewer_certificate {
 
 # DynamoDB table for visitor counter
 resource "aws_dynamodb_table" "visitor_counter" {
-  name           = "VisitorCounter" 
-  billing_mode   = "PAY_PER_REQUEST" 
-  hash_key       = "id"              
+  name         = "VisitorCounter"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
 
   attribute {
-    name = "id"                      
-    type = "S"                       
+    name = "id"
+    type = "S"
   }
 
   tags = {
@@ -140,13 +140,13 @@ data "aws_iam_role" "lambda_execution_role" {
 
 # Lambda function
 resource "aws_lambda_function" "visitor_counter" {
-  filename         = "lambda_function.zip"
-  function_name    = "VisitorCounterFunction"
-  role            = data.aws_iam_role.lambda_execution_role.arn
-  handler         = "lambda_function.lambda_handler"
-  runtime         = "python3.11"
-  timeout         = 3
-  memory_size     = 128
+  filename      = "lambda_function.zip"
+  function_name = "VisitorCounterFunction"
+  role          = data.aws_iam_role.lambda_execution_role.arn
+  handler       = "lambda_function.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 3
+  memory_size   = 128
 
   environment {
     variables = {
