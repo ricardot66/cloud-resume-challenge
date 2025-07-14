@@ -1,7 +1,4 @@
-# Cost-optimized security configuration
-# Demonstrates enterprise security knowledge while keeping costs under $15/month
-
-# KMS Key for encryption (keep this - only $1/month)
+# KMS Key for encryption at rest
 resource "aws_kms_key" "main" {
   description             = "${local.name_prefix} encryption key"
   deletion_window_in_days = 7
@@ -45,96 +42,136 @@ resource "aws_kms_alias" "main" {
   target_key_id = aws_kms_key.main.key_id
 }
 
-# VPC Flow Logs (low cost)
-resource "aws_flow_log" "vpc_flow_log" {
-  count           = var.environment == "prod" ? 1 : 0 # Only in prod to save costs
-  iam_role_arn    = aws_iam_role.flow_log[0].arn
-  log_destination = aws_cloudwatch_log_group.vpc_flow_log[0].arn
-  traffic_type    = "ALL"
-  vpc_id          = aws_vpc.main[0].id
-}
-
-resource "aws_cloudwatch_log_group" "vpc_flow_log" {
-  count             = var.environment == "prod" ? 1 : 0
-  name              = "/aws/vpc/flowlogs-${local.name_prefix}"
-  retention_in_days = 7 # Short retention to save costs
-  kms_key_id        = aws_kms_key.main.arn
-}
-
-resource "aws_iam_role" "flow_log" {
-  count = var.environment == "prod" ? 1 : 0
-  name  = "${local.name_prefix}-flow-log-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "vpc-flow-logs.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "flow_log" {
-  count = var.environment == "prod" ? 1 : 0
-  name  = "${local.name_prefix}-flow-log-policy"
-  role  = aws_iam_role.flow_log[0].id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogGroups",
-          "logs:DescribeLogStreams"
-        ]
-        Effect   = "Allow"
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-# Simplified VPC (no NAT Gateway for dev) 
-resource "aws_vpc" "main" {
-  count                = var.environment == "prod" ? 1 : 0 # Only create VPC for prod
+# VPC for Lambda security
+resource "aws_vpc" "lambda_vpc" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-vpc"
+    Name = "${local.name_prefix}-lambda-vpc"
   })
 }
 
-resource "aws_subnet" "private" {
-  count                   = var.environment == "prod" ? 2 : 0
-  vpc_id                  = aws_vpc.main[0].id
-  cidr_block              = "10.0.${count.index + 1}.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
-  map_public_ip_on_launch = false # Fix for CKV_AWS_130
+resource "aws_subnet" "lambda_private" {
+  count             = 2
+  vpc_id            = aws_vpc.lambda_vpc.id
+  cidr_block        = "10.0.${count.index + 1}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-private-${count.index + 1}"
+    Name = "${local.name_prefix}-lambda-private-${count.index + 1}"
   })
 }
 
-resource "aws_subnet" "public" {
-  count                   = var.environment == "prod" ? 2 : 0
-  vpc_id                  = aws_vpc.main[0].id
+resource "aws_subnet" "lambda_public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.lambda_vpc.id
   cidr_block              = "10.0.${count.index + 10}.0/24"
   availability_zone       = data.aws_availability_zones.available.names[count.index]
-  map_public_ip_on_launch = false # Fix for CKV_AWS_130 - manually assign when needed
+  map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-public-${count.index + 1}"
+    Name = "${local.name_prefix}-lambda-public-${count.index + 1}"
+  })
+}
+
+resource "aws_internet_gateway" "lambda_igw" {
+  vpc_id = aws_vpc.lambda_vpc.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-igw"
+  })
+}
+
+resource "aws_route_table" "lambda_public" {
+  vpc_id = aws_vpc.lambda_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.lambda_igw.id
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-public-rt"
+  })
+}
+
+resource "aws_route_table_association" "lambda_public" {
+  count          = 2
+  subnet_id      = aws_subnet.lambda_public[count.index].id
+  route_table_id = aws_route_table.lambda_public.id
+}
+
+resource "aws_nat_gateway" "lambda_nat" {
+  count         = 2
+  allocation_id = aws_eip.lambda_nat[count.index].id
+  subnet_id     = aws_subnet.lambda_public[count.index].id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-nat-${count.index + 1}"
+  })
+
+  depends_on = [aws_internet_gateway.lambda_igw]
+}
+
+resource "aws_eip" "lambda_nat" {
+  count  = 2
+  domain = "vpc"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-nat-eip-${count.index + 1}"
+  })
+}
+
+resource "aws_route_table" "lambda_private" {
+  count  = 2
+  vpc_id = aws_vpc.lambda_vpc.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.lambda_nat[count.index].id
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-private-rt-${count.index + 1}"
+  })
+}
+
+resource "aws_route_table_association" "lambda_private" {
+  count          = 2
+  subnet_id      = aws_subnet.lambda_private[count.index].id
+  route_table_id = aws_route_table.lambda_private[count.index].id
+}
+
+# Security Group for Lambda
+resource "aws_security_group" "lambda_sg" {
+  name        = "${local.name_prefix}-lambda-sg"
+  description = "Security group for Lambda function"
+  vpc_id      = aws_vpc.lambda_vpc.id
+
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS outbound for AWS services"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lambda-sg"
+  })
+}
+
+# VPC Endpoint for DynamoDB
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.lambda_vpc.id
+  service_name      = "com.amazonaws.${data.aws_region.current.name}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = aws_route_table.lambda_private[*].id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-dynamodb-endpoint"
   })
 }
 
@@ -142,7 +179,7 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# S3 Bucket for Website with Cost-Optimized Security
+# S3 Bucket for Website with Maximum Security
 resource "aws_s3_bucket" "website" {
   bucket = "${local.name_prefix}-website-${random_string.bucket_suffix.result}"
   tags   = local.common_tags
@@ -154,7 +191,7 @@ resource "random_string" "bucket_suffix" {
   upper   = false
 }
 
-# S3 Security Configuration (All 4 public access blocks)
+# S3 Bucket Security Configuration (All 4 public access blocks)
 resource "aws_s3_bucket_public_access_block" "website" {
   bucket = aws_s3_bucket.website.id
 
@@ -205,6 +242,56 @@ resource "aws_s3_bucket_lifecycle_configuration" "website" {
   }
 }
 
+resource "aws_s3_bucket_logging" "website" {
+  bucket = aws_s3_bucket.website.id
+
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "website-access-logs/"
+}
+
+# S3 Bucket for Access Logs
+resource "aws_s3_bucket" "access_logs" {
+  bucket = "${local.name_prefix}-access-logs-${random_string.bucket_suffix.result}"
+  tags   = local.common_tags
+}
+
+resource "aws_s3_bucket_public_access_block" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.main.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  rule {
+    id     = "delete_old_logs"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
 # CloudFront Origin Access Control
 resource "aws_cloudfront_origin_access_control" "website" {
   name                              = "${local.name_prefix}-oac"
@@ -214,7 +301,7 @@ resource "aws_cloudfront_origin_access_control" "website" {
   signing_protocol                  = "sigv4"
 }
 
-# WAF with Logging Configuration
+# Enhanced WAF with Log4j protection
 resource "aws_wafv2_web_acl" "website" {
   name  = "${local.name_prefix}-waf"
   scope = "CLOUDFRONT"
@@ -251,7 +338,7 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
-  # AWS Managed Rules
+  # AWS Managed Rules for Common attacks
   rule {
     name     = "AWSManagedRulesCommonRuleSet"
     priority = 2
@@ -304,50 +391,7 @@ resource "aws_wafv2_web_acl" "website" {
   }
 }
 
-# WAF Logging Configuration
-resource "aws_wafv2_web_acl_logging_configuration" "website" {
-  resource_arn            = aws_wafv2_web_acl.website.arn
-  log_destination_configs = [aws_cloudwatch_log_group.waf_log.arn]
-
-  redacted_fields {
-    single_header {
-      name = "authorization"
-    }
-  }
-}
-
-resource "aws_cloudwatch_log_group" "waf_log" {
-  name              = "/aws/wafv2/${local.name_prefix}"
-  retention_in_days = 7 # Short retention to save costs
-  kms_key_id        = aws_kms_key.main.arn
-}
-
-# CloudFront Response Headers Policy
-resource "aws_cloudfront_response_headers_policy" "security_headers" {
-  name = "${local.name_prefix}-security-headers"
-
-  security_headers_config {
-    strict_transport_security {
-      access_control_max_age_sec = 31536000
-      include_subdomains         = true
-      preload                    = true
-      override                   = false
-    }
-    content_type_options {
-      override = false
-    }
-    frame_options {
-      frame_option = "DENY"
-      override     = false
-    }
-    referrer_policy {
-      referrer_policy = "strict-origin-when-cross-origin"
-      override        = false
-    }
-  }
-}
-
-# CloudFront Distribution with Cost-Optimized Security
+# CloudFront Distribution with Maximum Security
 resource "aws_cloudfront_distribution" "website" {
   count = var.enable_cdn ? 1 : 0
 
@@ -394,11 +438,11 @@ resource "aws_cloudfront_distribution" "website" {
     }
   }
 
-  # Access logging (basic - no separate bucket needed)
+  # Access logging
   logging_config {
     include_cookies = false
-    bucket          = aws_s3_bucket.website.bucket_domain_name
-    prefix          = "access-logs/"
+    bucket          = aws_s3_bucket.cloudfront_logs.bucket_domain_name
+    prefix          = "cloudfront-logs/"
   }
 
   default_cache_behavior {
@@ -414,11 +458,10 @@ resource "aws_cloudfront_distribution" "website" {
     }
 
     # Force HTTPS
-    viewer_protocol_policy     = "redirect-to-https"
-    response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
-    min_ttl                    = 0
-    default_ttl                = 3600
-    max_ttl                    = 86400
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
   }
 
   # WAF Association
@@ -455,6 +498,38 @@ resource "aws_s3_bucket_lifecycle_configuration" "failover_website" {
   rule {
     id     = "abort_incomplete_multipart_uploads"
     status = "Enabled"
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+# CloudFront Logs Bucket
+resource "aws_s3_bucket" "cloudfront_logs" {
+  bucket = "${local.name_prefix}-cf-logs-${random_string.bucket_suffix.result}"
+  tags   = local.common_tags
+}
+
+resource "aws_s3_bucket_public_access_block" "cloudfront_logs" {
+  bucket = aws_s3_bucket.cloudfront_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "cloudfront_logs" {
+  bucket = aws_s3_bucket.cloudfront_logs.id
+
+  rule {
+    id     = "delete_old_logs"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
@@ -514,7 +589,17 @@ resource "aws_dynamodb_table" "visitor_count" {
   tags = local.common_tags
 }
 
-# Lambda Execution Role (no VPC for cost savings)
+# SQS Dead Letter Queue for Lambda
+resource "aws_sqs_queue" "lambda_dlq" {
+  name = "${local.name_prefix}-lambda-dlq"
+
+  kms_master_key_id                 = aws_kms_key.main.arn
+  kms_data_key_reuse_period_seconds = 300
+
+  tags = local.common_tags
+}
+
+# Lambda Execution Role with enhanced permissions
 resource "aws_iam_role" "lambda_execution" {
   name = "${local.name_prefix}-lambda-execution"
 
@@ -567,6 +652,11 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_execution.name
 }
 
+resource "aws_iam_role_policy_attachment" "lambda_vpc" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  role       = aws_iam_role.lambda_execution.name
+}
+
 resource "aws_iam_role_policy" "lambda_xray" {
   name = "${local.name_prefix}-lambda-xray"
   role = aws_iam_role.lambda_execution.id
@@ -586,7 +676,7 @@ resource "aws_iam_role_policy" "lambda_xray" {
   })
 }
 
-# Lambda Function with Cost-Optimized Security
+# Lambda Function with Maximum Security
 resource "aws_lambda_function" "visitor_counter" {
   filename      = "lambda.zip"
   function_name = "${local.name_prefix}-visitor-counter"
@@ -595,6 +685,17 @@ resource "aws_lambda_function" "visitor_counter" {
   runtime       = "python3.9"
   timeout       = var.lambda_timeout
   memory_size   = var.lambda_memory_size
+
+  # VPC Configuration
+  vpc_config {
+    subnet_ids         = aws_subnet.lambda_private[*].id
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+
+  # Dead Letter Queue
+  dead_letter_config {
+    target_arn = aws_sqs_queue.lambda_dlq.arn
+  }
 
   # X-Ray Tracing
   tracing_config {
@@ -618,6 +719,7 @@ resource "aws_lambda_function" "visitor_counter" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic,
+    aws_iam_role_policy_attachment.lambda_vpc,
     aws_cloudwatch_log_group.lambda_logs
   ]
 }
@@ -630,7 +732,7 @@ resource "aws_cloudwatch_log_group" "lambda_logs" {
   tags              = local.common_tags
 }
 
-# API Gateway with Security and Caching
+# API Gateway with enhanced security
 resource "aws_api_gateway_rest_api" "visitor_counter" {
   name        = "${local.name_prefix}-visitor-api"
   description = "Visitor Counter API for ${local.name_prefix}"
@@ -733,18 +835,10 @@ resource "aws_api_gateway_deployment" "visitor_counter" {
   }
 }
 
-# API Gateway Stage with Caching and X-Ray
 resource "aws_api_gateway_stage" "visitor_counter" {
   deployment_id = aws_api_gateway_deployment.visitor_counter.id
   rest_api_id   = aws_api_gateway_rest_api.visitor_counter.id
   stage_name    = var.environment
-
-  # Enable caching for performance and cost optimization
-  cache_cluster_enabled = true
-  cache_cluster_size    = "0.5" # Smallest size to save costs
-
-  # Enable X-Ray tracing
-  xray_tracing_enabled = true
 
   # Enable access logging
   access_log_settings {
@@ -764,21 +858,6 @@ resource "aws_api_gateway_stage" "visitor_counter" {
   }
 
   tags = local.common_tags
-}
-
-# Method settings for caching
-resource "aws_api_gateway_method_settings" "visitor_counter" {
-  rest_api_id = aws_api_gateway_rest_api.visitor_counter.id
-  stage_name  = aws_api_gateway_stage.visitor_counter.stage_name
-  method_path = "*/*"
-
-  settings {
-    metrics_enabled      = true
-    logging_level        = "INFO"
-    caching_enabled      = true
-    cache_ttl_in_seconds = 300 # 5 minutes cache
-    cache_data_encrypted = true
-  }
 }
 
 resource "aws_cloudwatch_log_group" "api_gateway_logs" {
