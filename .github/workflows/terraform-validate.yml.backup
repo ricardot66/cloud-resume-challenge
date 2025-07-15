@@ -1,0 +1,33 @@
+name: Terraform Validation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+        
+    - name: Terraform Init
+      working-directory: infrastructure/aws/terraform
+      run: terraform init
+      
+    - name: Terraform Validate
+      working-directory: infrastructure/aws/terraform
+      run: terraform validate
+      
+    - name: Terraform Plan
+      working-directory: infrastructure/aws/terraform
+      run: terraform plan
