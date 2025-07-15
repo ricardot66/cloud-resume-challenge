@@ -539,13 +539,30 @@ resource "aws_s3_bucket_policy" "website" {
             "AWS:SourceArn" = var.enable_cdn ? aws_cloudfront_distribution.website[0].arn : ""
           }
         }
+      },
+      {
+        Sid    = "AllowGitHubActionsAccess"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action = [
+          "s3:PutObject",
+          "s3:PutObjectAcl", 
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.website.arn,
+          "${aws_s3_bucket.website.arn}/*"
+        ]
       }
     ]
   })
 
   depends_on = [aws_s3_bucket_public_access_block.website]
 }
-
 
 # DynamoDB Table with KMS Encryption
 resource "aws_dynamodb_table" "visitor_count" {
