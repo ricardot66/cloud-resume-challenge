@@ -1001,3 +1001,11 @@ resource "aws_s3_bucket_logging" "failover_website" {
   target_bucket = aws_s3_bucket.access_logs.id
   target_prefix = "failover-access-logs/"
 }
+
+# S3 versioning for access logs bucket (CKV_AWS_21)
+resource "aws_s3_bucket_versioning" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
