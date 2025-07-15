@@ -163,6 +163,7 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+
 # S3 Bucket for Website with Cost-Optimized Security
 resource "aws_s3_bucket" "website" {
   bucket = "${local.name_prefix}-website-${random_string.bucket_suffix.result}"
@@ -861,11 +862,13 @@ resource "aws_api_gateway_method_settings" "visitor_counter" {
   method_path = "*/*"
 
   settings {
-    metrics_enabled      = true
-    logging_level        = "INFO"
-    caching_enabled      = true
-    cache_ttl_in_seconds = 300 # 5 minutes cache
-    cache_data_encrypted = true
+    metrics_enabled        = true
+    logging_level          = "INFO"
+    caching_enabled        = true
+    cache_ttl_in_seconds   = 300
+    cache_data_encrypted   = true
+    throttling_rate_limit  = 100
+    throttling_burst_limit = 50
   }
 }
 
@@ -888,4 +891,19 @@ resource "aws_acm_certificate" "website" {
   }
 
   tags = local.common_tags
+}
+
+resource "aws_default_security_group" "default" {
+  count  = var.environment == "prod" ? 1 : 0
+  vpc_id = aws_vpc.main[0].id
+
+  # No ingress rules = deny all inbound
+  ingress = []
+
+  # No egress rules = deny all outbound  
+  egress = []
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-default-sg-restricted"
+  })
 }
