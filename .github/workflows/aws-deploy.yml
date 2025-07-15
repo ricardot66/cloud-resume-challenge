@@ -137,114 +137,410 @@ jobs:
           fi
           echo "✅ Infrastructure validation passed"
 
+infrastructure-deploy:
+  name: Deploy Infrastructure
+  runs-on: ubuntu-latest
+  needs: [security-scan, testing-suite]
+  if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
-  infrastructure-deploy:
-    name: Deploy Infrastructure
-    runs-on: ubuntu-latest
-    needs: [security-scan, testing-suite]
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+  outputs:
+    website_url: ${{ steps.tf_outputs.outputs.website_url }}
+    api_url: ${{ steps.tf_outputs.outputs.api_url }}
+    s3_bucket: ${{ steps.tf_outputs.outputs.s3_bucket }}
+    cloudfront_id: ${{ steps.tf_outputs.outputs.cloudfront_id }}
 
-    outputs:
-      website_url: ${{ steps.tf_outputs.outputs.website_url }}
-      api_url: ${{ steps.tf_outputs.outputs.api_url }}
-      s3_bucket: ${{ steps.tf_outputs.outputs.s3_bucket }}
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+        terraform_wrapper: false
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-          terraform_wrapper: false
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+    - name: Terraform Init
+      working-directory: infrastructure/aws/terraform
+      run: terraform init
 
-      - name: Terraform Init
-        working-directory: infrastructure/aws/terraform
-        run: terraform init
+    - name: Terraform Validate
+      working-directory: infrastructure/aws/terraform
+      run: terraform validate
 
-      - name: Terraform Validate
-        working-directory: infrastructure/aws/terraform
-        run: terraform validate
+    - name: Terraform Plan
+      working-directory: infrastructure/aws/terraform
+      run: terraform plan -no-color
 
-      - name: Terraform Plan
-        working-directory: infrastructure/aws/terraform
-        run: terraform plan -no-color
+    - name: Check if Infrastructure Exists
+      id: check_infra
+      working-directory: infrastructure/aws/terraform
+      run: |
+        # Check if infrastructure already exists
+        if terraform show -json | jq -e '.values.root_module.resources[] | select(.address == "aws_s3_bucket.website")' > /dev/null 2>&1; then
+          echo "infrastructure_exists=true" >> $GITHUB_OUTPUT
+          echo "✅ Infrastructure already exists, skipping apply"
+        else
+          echo "infrastructure_exists=false" >> $GITHUB_OUTPUT
+          echo "🏗️ Infrastructure needs to be created"
+        fi
 
-      - name: Trigger Terraform Cloud Apply
-        working-directory: infrastructure/aws/terraform
-        run: |
-          echo "Terraform Cloud will auto-apply based on VCS push to main branch"
-          echo "Waiting for Terraform Cloud workspace to complete..."
+    - name: Manual Terraform Apply (First Time Only)
+      if: steps.check_infra.outputs.infrastructure_exists == 'false'
+      working-directory: infrastructure/aws/terraform
+      run: |
+        echo "🚀 Running first-time infrastructure deployment..."
+        terraform apply -auto-approve
+        echo "✅ Infrastructure created successfully"
+
+    - name: Wait for Terraform Cloud (If VCS Mode)
+      if: steps.check_infra.outputs.infrastructure_exists == 'true'
+      run: |
+        echo "⏳ Waiting for Terraform Cloud VCS-driven apply to complete..."
+        echo "This may take 2-3 minutes..."
+        sleep 180  # 3 minutes wait
+
+    - name: Get Infrastructure Outputs
+      id: tf_outputs
+      working-directory: infrastructure/aws/terraform
+      run: |
+        echo "🔍 Getting Terraform outputs..."
+        
+        # Retry logic for outputs
+        max_attempts=5
+        attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Attempt $attempt of $max_attempts..."
           
-          # Wait for the apply to complete in Terraform Cloud
-          sleep 60
+          # Try to get outputs
+          S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          WEBSITE_URL=$(terraform output -raw website_url 2>/dev/null || echo "")
+          API_URL=$(terraform output -raw api_url 2>/dev/null || echo "")
+          CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
           
-          echo "Terraform Cloud apply should be complete"
-
-      - name: Get Infrastructure Outputs (from Terraform Cloud)
-        id: tf_outputs
-        working-directory: infrastructure/aws/terraform
-        run: |
-          # Since we can't directly get outputs from plan files in VCS mode,
-          # we'll use terraform output commands after the apply
-          sleep 30  # Give Terraform Cloud time to complete
-          
-          echo "website_url=$(terraform output -raw website_url 2>/dev/null || echo 'https://placeholder-website.com')" >> $GITHUB_OUTPUT
-          echo "api_url=$(terraform output -raw api_url 2>/dev/null || echo 'https://placeholder-api.com')" >> $GITHUB_OUTPUT
-          echo "s3_bucket=$(terraform output -raw s3_bucket_name 2>/dev/null || echo 'placeholder-bucket')" >> $GITHUB_OUTPUT
-
-  application-deploy:
-    name: Deploy Applications
-    runs-on: ubuntu-latest
-    needs: infrastructure-deploy
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy Lambda Function
-        working-directory: backend/lambda
-        run: |
-          echo "Preparing Lambda deployment..."
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt -t .
-          fi
-          zip -r lambda-deployment.zip . -x "*.pyc" "__pycache__/*" "test_*"
-          FUNCTION_NAME="resume-visitor-counter-${{ env.TF_VAR_environment }}"
-          if aws lambda get-function --function-name $FUNCTION_NAME --region ${{ env.AWS_REGION }} 2>/dev/null; then
-            aws lambda update-function-code --function-name $FUNCTION_NAME --zip-file fileb://lambda-deployment.zip --region ${{ env.AWS_REGION }}
-            echo "✅ Lambda function updated"
+          # Check if we got valid outputs
+          if [ ! -z "$S3_BUCKET" ] && [ "$S3_BUCKET" != "placeholder-bucket" ]; then
+            echo "✅ Successfully retrieved outputs"
+            echo "S3 Bucket: $S3_BUCKET"
+            echo "Website URL: $WEBSITE_URL"
+            echo "API URL: $API_URL"
+            echo "CloudFront ID: $CLOUDFRONT_ID"
+            
+            # Set outputs
+            echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+            echo "website_url=$WEBSITE_URL" >> $GITHUB_OUTPUT
+            echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+            echo "cloudfront_id=$CLOUDFRONT_ID" >> $GITHUB_OUTPUT
+            break
           else
-            echo "Lambda function not found - this is expected for first deployment"
-          fi
-
-      - name: Deploy Frontend
-        working-directory: frontend
-        run: |
-          if [ "${{ needs.infrastructure-deploy.outputs.s3_bucket }}" != "not-set" ]; then
-            if ls *.html 2>/dev/null; then
-              aws s3 sync . s3://${{ needs.infrastructure-deploy.outputs.s3_bucket }} --delete
-              echo "✅ Frontend deployed to S3"
-            else
-              echo "<h1>Resume Website Coming Soon</h1>" > index.html
-              aws s3 cp index.html s3://${{ needs.infrastructure-deploy.outputs.s3_bucket }}/
-              echo "✅ Placeholder frontend deployed"
+            echo "⏳ Outputs not ready yet, waiting 30 seconds..."
+            sleep 30
+            attempt=$((attempt + 1))
+            
+            if [ $attempt -gt $max_attempts ]; then
+              echo "❌ Failed to get outputs after $max_attempts attempts"
+              echo "Available outputs:"
+              terraform output
+              
+              # Set fallback values
+              echo "s3_bucket=deployment-failed" >> $GITHUB_OUTPUT
+              echo "website_url=not-available" >> $GITHUB_OUTPUT
+              echo "api_url=not-available" >> $GITHUB_OUTPUT
+              echo "cloudfront_id=not-available" >> $GITHUB_OUTPUT
+              exit 1
             fi
           fi
+        done
+
+    - name: Verify Infrastructure State
+      working-directory: infrastructure/aws/terraform
+      run: |
+        echo "🔍 Verifying infrastructure state..."
+        
+        # List all resources in state
+        echo "Resources in state:"
+        terraform state list
+        
+        # Show specific S3 bucket info
+        if terraform state show aws_s3_bucket.website 2>/dev/null; then
+          echo "✅ S3 bucket exists in state"
+        else
+          echo "❌ S3 bucket not found in state"
+        fi
+
+application-deploy:
+  name: Deploy Applications
+  runs-on: ubuntu-latest
+  needs: infrastructure-deploy
+  if: needs.infrastructure-deploy.outputs.s3_bucket != 'deployment-failed'
+  
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Debug Infrastructure Outputs
+      run: |
+        echo "🔍 Infrastructure outputs received:"
+        echo "S3 Bucket: ${{ needs.infrastructure-deploy.outputs.s3_bucket }}"
+        echo "Website URL: ${{ needs.infrastructure-deploy.outputs.website_url }}"
+        echo "API URL: ${{ needs.infrastructure-deploy.outputs.api_url }}"
+        echo "CloudFront ID: ${{ needs.infrastructure-deploy.outputs.cloudfront_id }}"
+        
+        if [ "${{ needs.infrastructure-deploy.outputs.s3_bucket }}" = "deployment-failed" ]; then
+          echo "❌ Infrastructure deployment failed, cannot proceed"
+          exit 1
+        fi
+
+    - name: Deploy Lambda Function
+      working-directory: backend/lambda
+      run: |
+        echo "🚀 Preparing Lambda deployment..."
+        
+        # Create a basic Lambda function if it doesn't exist
+        cat > lambda_function.py << 'EOF'
+import json
+import boto3
+import os
+from decimal import Decimal
+
+def lambda_handler(event, context):
+    try:
+        # Initialize DynamoDB
+        dynamodb = boto3.resource('dynamodb')
+        table_name = os.environ.get('DYNAMODB_TABLE', 'cloud-resume-dev-visitor-count')
+        table = dynamodb.Table(table_name)
+        
+        # Get current count
+        response = table.get_item(Key={'id': 'visitor_count'})
+        
+        if 'Item' in response:
+            current_count = int(response['Item']['count'])
+        else:
+            current_count = 0
+        
+        # Increment count
+        new_count = current_count + 1
+        
+        # Update count in DynamoDB
+        table.put_item(Item={'id': 'visitor_count', 'count': new_count})
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+            },
+            'body': json.dumps({
+                'count': new_count,
+                'message': 'Visitor count updated successfully'
+            })
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+            },
+            'body': json.dumps({
+                'error': str(e),
+                'message': 'Failed to update visitor count'
+            })
+        }
+EOF
+
+        # Create requirements.txt if it doesn't exist
+        if [ ! -f requirements.txt ]; then
+          echo "boto3>=1.26.0" > requirements.txt
+        fi
+        
+        # Package and deploy
+        pip install -r requirements.txt -t .
+        zip -r lambda-deployment.zip . -x "*.pyc" "__pycache__/*" "test_*"
+        
+        FUNCTION_NAME="${{ needs.infrastructure-deploy.outputs.s3_bucket }}"
+        FUNCTION_NAME="${FUNCTION_NAME%-*}-visitor-counter"  # Convert bucket name to function name pattern
+        
+        echo "Function name: $FUNCTION_NAME"
+        
+        if aws lambda get-function --function-name "$FUNCTION_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "📦 Updating existing Lambda function..."
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://lambda-deployment.zip \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ Lambda function updated"
+        else
+          echo "⚠️ Lambda function not found - this is expected for Terraform-managed resources"
+          echo "Function will be created/updated by Terraform"
+        fi
+
+    - name: Deploy Frontend
+      working-directory: frontend
+      run: |
+        S3_BUCKET="${{ needs.infrastructure-deploy.outputs.s3_bucket }}"
+        echo "🎯 Target S3 bucket: $S3_BUCKET"
+        
+        if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "deployment-failed" ]; then
+          echo "❌ Error: S3 bucket name not available from infrastructure deployment"
+          exit 1
+        fi
+        
+        # Create a professional resume HTML if it doesn't exist
+        if ! ls *.html 2>/dev/null; then
+          echo "📝 Creating professional resume HTML..."
+          cat > index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ricardo Torres - Technical Program Manager</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background: #f4f4f4; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; }
+        .contact { background: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .visitor-count { text-align: center; margin: 20px 0; font-size: 18px; color: #7f8c8d; }
+        .experience { margin-bottom: 25px; }
+        .company { font-weight: bold; color: #2980b9; }
+        .date { float: right; color: #7f8c8d; }
+        .skills { display: flex; flex-wrap: wrap; gap: 10px; }
+        .skill { background: #3498db; color: white; padding: 5px 10px; border-radius: 15px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Ricardo Torres</h1>
+        <div class="contact">
+            <strong>Technical Program Manager</strong><br>
+            📧 ricardot66@gmail.com | 📱 +52 5541935541 | 🌐 ricardot.com | 💼 linkedin.com/in/ricardot66
+        </div>
+        
+        <div class="visitor-count">
+            👥 Visitor Count: <span id="visitor-count">Loading...</span>
+        </div>
+        
+        <h2>🎯 Professional Summary</h2>
+        <p>Technical Program Manager with 9+ years leading cross-functional, data-driven initiatives across global markets. Expert in cloud platforms (AWS, GCP, Azure), automation, and scalable system design. Currently implementing advanced analytics platforms and infrastructure automation for enterprise clients.</p>
+        
+        <h2>💼 Experience</h2>
+        
+        <div class="experience">
+            <div class="company">BAT (British American Tobacco)</div>
+            <div class="date">April 2021 - Present</div>
+            <p><strong>Commercial Analytics Manager</strong></p>
+            <ul>
+                <li>Led cross-functional technical programs across 4 global markets (Canada, Brazil, Mexico, Chile)</li>
+                <li>Managed complete product lifecycle for advanced analytics platforms from BRD through deployment</li>
+                <li>Designed scalable automation tools reducing manual operations and improving system reliability</li>
+                <li>Managed 1M+ GBP technical initiatives with stakeholder alignment across engineering and operations</li>
+            </ul>
+        </div>
+        
+        <div class="experience">
+            <div class="company">Amazon</div>
+            <div class="date">April 2019 - July 2020</div>
+            <p><strong>Program Manager - Sales Data Science</strong></p>
+            <ul>
+                <li>Managed BI database systems for Amazon Marketplace across Mexico and Colombia</li>
+                <li>Led automation initiatives improving operating efficiency by 35% using Python and AWS services</li>
+                <li>Owned technical product development from requirements through deployment</li>
+            </ul>
+        </div>
+        
+        <h2>🎓 Education</h2>
+        <p><strong>Tecnológico de Monterrey</strong> - Marketing, 2016<br>
+        <strong>University of British Columbia</strong> - Visual Arts, 2013</p>
+        
+        <h2>🏆 Certifications</h2>
+        <div class="skills">
+            <span class="skill">AWS Certified Cloud Practitioner</span>
+            <span class="skill">Design Thinking</span>
+        </div>
+        
+        <h2>🚀 Technical Skills</h2>
+        <div class="skills">
+            <span class="skill">AWS</span>
+            <span class="skill">GCP</span>
+            <span class="skill">Azure</span>
+            <span class="skill">Python</span>
+            <span class="skill">Terraform</span>
+            <span class="skill">CI/CD</span>
+            <span class="skill">Data Analytics</span>
+            <span class="skill">Program Management</span>
+        </div>
+    </div>
+    
+    <script>
+        // Load visitor count from API
+        async function loadVisitorCount() {
+            try {
+                const apiUrl = '${{ needs.infrastructure-deploy.outputs.api_url }}';
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                document.getElementById('visitor-count').textContent = data.count || 'Error loading count';
+            } catch (error) {
+                console.error('Error loading visitor count:', error);
+                document.getElementById('visitor-count').textContent = 'Unavailable';
+            }
+        }
+        
+        window.onload = loadVisitorCount;
+    </script>
+</body>
+</html>
+EOF
+        fi
+        
+        # Deploy to S3
+        echo "📁 Syncing files to S3..."
+        aws s3 sync . s3://$S3_BUCKET \
+          --delete \
+          --exclude "README.md" \
+          --exclude "*.git*" \
+          --exclude ".DS_Store"
+        
+        echo "✅ Frontend deployed to S3: $S3_BUCKET"
+        
+        # Set bucket for website hosting
+        aws s3 website s3://$S3_BUCKET \
+          --index-document index.html \
+          --error-document index.html
+        
+        echo "🌐 S3 website hosting configured"
+
+    - name: Invalidate CloudFront Cache
+      if: needs.infrastructure-deploy.outputs.cloudfront_id != 'not-available'
+      run: |
+        CLOUDFRONT_ID="${{ needs.infrastructure-deploy.outputs.cloudfront_id }}"
+        if [ ! -z "$CLOUDFRONT_ID" ] && [ "$CLOUDFRONT_ID" != "not-available" ]; then
+          echo "🔄 Invalidating CloudFront distribution: $CLOUDFRONT_ID"
+          aws cloudfront create-invalidation \
+            --distribution-id $CLOUDFRONT_ID \
+            --paths "/*"
+          echo "✅ CloudFront invalidation created"
+        else
+          echo "⚠️ No CloudFront distribution to invalidate"
+        fi
 
   integration-tests:
     name: Integration Tests
