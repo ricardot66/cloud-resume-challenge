@@ -74,6 +74,7 @@ variable "cost_allocation_tags" {
 }
 
 # Environment-specific configurations (demonstrates program management planning)
+
 locals {
   environment_config = {
     dev = {
@@ -81,21 +82,21 @@ locals {
       lambda_timeout    = 30
       dynamodb_billing  = "PAY_PER_REQUEST"
       enable_cdn        = false
-      retention_in_days = 7
+      retention_in_days = 180
     }
     staging = {
       lambda_memory     = 256
       lambda_timeout    = 60
       dynamodb_billing  = "PAY_PER_REQUEST"
       enable_cdn        = true
-      retention_in_days = 14
+      retention_in_days = 180
     }
     prod = {
       lambda_memory     = 512
       lambda_timeout    = 60
       dynamodb_billing  = "PAY_PER_REQUEST"
       enable_cdn        = true
-      retention_in_days = 30
+      retention_in_days = 365
     }
   }
 
