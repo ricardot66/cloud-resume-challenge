@@ -939,3 +939,65 @@ resource "aws_wafv2_web_acl_association" "api_gateway" {
   resource_arn = aws_api_gateway_stage.visitor_counter.arn
   web_acl_arn  = aws_wafv2_web_acl.website.arn
 }
+
+
+
+
+# S3 bucket for access logs (required for logging)
+resource "aws_s3_bucket" "access_logs" {
+  bucket = "${local.name_prefix}-access-logs-${random_string.bucket_suffix.result}"
+  tags   = local.common_tags
+}
+
+resource "aws_s3_bucket_public_access_block" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.main.arn
+      sse_algorithm     = "aws:kms"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  rule {
+    id     = "delete_old_logs"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+# S3 Access logging for compliance (CKV_AWS_18)
+resource "aws_s3_bucket_logging" "website" {
+  bucket = aws_s3_bucket.website.id
+
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "website-access-logs/"
+}
+
+resource "aws_s3_bucket_logging" "failover_website" {
+  bucket = aws_s3_bucket.failover_website.id
+
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "failover-access-logs/"
+}
