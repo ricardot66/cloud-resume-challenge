@@ -108,6 +108,10 @@ jobs:
         run: |
           echo "📦 Creating Lambda deployment package for Terraform..."
           
+          # Clean up any existing packages first
+          rm -f ../../infrastructure/aws/terraform/lambda.zip
+          rm -rf __pycache__ *.pyc
+          
           cat > lambda_function.py << 'EOF'
           import json
           import boto3
@@ -146,14 +150,35 @@ jobs:
                   }
           EOF
           
-          if [ ! -f requirements.txt ]; then
-            echo "boto3>=1.26.0" > requirements.txt
+          # Create clean requirements.txt
+          cat > requirements.txt << 'EOF'
+          boto3>=1.26.0
+          EOF
+          
+          # Install dependencies in clean directory
+          rm -rf ./package
+          mkdir -p ./package
+          pip install -r requirements.txt -t ./package --no-cache-dir
+          
+          # Copy Lambda function to package directory
+          cp lambda_function.py ./package/
+          
+          # Create clean zip file
+          cd ./package
+          zip -r ../../../infrastructure/aws/terraform/lambda.zip . -x "*.pyc" "__pycache__/*"
+          cd ..
+          
+          # Verify zip file was created
+          if [ -f "../../infrastructure/aws/terraform/lambda.zip" ]; then
+            echo "✅ Lambda package created successfully"
+            ls -la ../../infrastructure/aws/terraform/lambda.zip
+          else
+            echo "❌ Failed to create Lambda package"
+            exit 1
           fi
           
-          pip install -r requirements.txt -t .
-          zip -r ../../infrastructure/aws/terraform/lambda.zip . -x "*.pyc" "__pycache__/*" "test_*"
-          
-          echo "✅ Lambda package created for Terraform"
+          # Clean up temporary package directory
+          rm -rf ./package
 
       - name: Frontend Validation
         working-directory: frontend
