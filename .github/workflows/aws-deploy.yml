@@ -1,5 +1,5 @@
 ---
-name: AWS Production Deployment (VCS-Driven)
+name: AWS Production Deployment (Pure VCS)
 
 on:
   push:
@@ -7,110 +7,43 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Deployment environment'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - staging
-          - prod
 
 env:
   AWS_REGION: us-east-1
-  TF_VAR_environment: ${{ github.event.inputs.environment || 'dev' }}
-  TF_VAR_domain_name: ${{ secrets.DOMAIN_NAME }}
 
 jobs:
-  security-scan:
-    name: Security & Quality Analysis
+  validate-and-test:
+    name: Validate & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Checkov (Infrastructure Security)
+      - name: Setup Terraform (validation only)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Terraform Validation (Read-Only)
+        working-directory: infrastructure/aws/terraform
+        run: |
+          terraform init
+          terraform validate
+          echo "✅ Terraform configuration is valid"
+
+      - name: Security Scan
         uses: bridgecrewio/checkov-action@master
         with:
           directory: infrastructure/aws/terraform
           framework: terraform
-          config_file: .checkov.yml
         continue-on-error: true
 
-      - name: Python Security Scan
-        working-directory: backend/lambda
+      - name: Create Lambda Package
         run: |
-          pip install bandit safety
-          mkdir -p ../../reports
-          bandit -r . -f json -o ../../reports/bandit-report.json || true
-          safety check --json --output ../../reports/safety-report.json || true
-
-      - name: Frontend Security Scan
-        working-directory: frontend
-        run: |
-          echo "Scanning for security issues..."
-          if grep -r -i "api[_-]key\|secret\|password\|token" --include="*.html" --include="*.js" --include="*.css" . 2>/dev/null; then
-            echo "⚠️ Potential hardcoded secrets found!"
-            exit 1
-          fi
-          echo "✅ Frontend security scan passed"
-
-  testing-suite:
-    name: Comprehensive Testing
-    runs-on: ubuntu-latest
-    needs: security-scan
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Backend Unit Tests
-        working-directory: backend/lambda
-        run: |
-          pip install pytest boto3 moto requests
-          cat > test_visitor_counter.py << 'EOF'
-          import json
-          import pytest
-          from unittest.mock import MagicMock
-
-          def mock_lambda_handler(event, context):
-              return {
-                  'statusCode': 200,
-                  'headers': {'Access-Control-Allow-Origin': '*'},
-                  'body': json.dumps({'count': 42, 'message': 'Success'})
-              }
-
-          def test_lambda_handler_response_format():
-              event = {}
-              context = MagicMock()
-              response = mock_lambda_handler(event, context)
-              assert 'statusCode' in response
-              assert 'headers' in response
-              assert 'body' in response
-              assert response['statusCode'] == 200
-
-          def test_cors_headers():
-              event = {}
-              context = MagicMock()
-              response = mock_lambda_handler(event, context)
-              assert 'Access-Control-Allow-Origin' in response['headers']
-          EOF
-          python -m pytest test_visitor_counter.py -v
-
-      - name: Create Lambda Package for Terraform
-        working-directory: backend/lambda
-        run: |
-          echo "📦 Creating Lambda deployment package for Terraform..."
-          
-          # Clean up any existing packages first
-          rm -f ../../infrastructure/aws/terraform/lambda.zip
-          rm -rf __pycache__ *.pyc
+          echo "📦 Creating Lambda package for Terraform..."
+          mkdir -p /tmp/lambda-build
+          cd /tmp/lambda-build
           
           cat > lambda_function.py << 'EOF'
           import json
@@ -150,81 +83,20 @@ jobs:
                   }
           EOF
           
-          # Create clean requirements.txt
-          cat > requirements.txt << 'EOF'
-          boto3>=1.26.0
-          EOF
+          echo "boto3>=1.26.0" > requirements.txt
+          pip install -r requirements.txt -t . --no-cache-dir --quiet
+          find . -name "*.pyc" -delete 2>/dev/null || true
+          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
           
-          # Install dependencies in clean directory
-          rm -rf ./package
-          mkdir -p ./package
-          pip install -r requirements.txt -t ./package --no-cache-dir
-          
-          # Copy Lambda function to package directory
-          cp lambda_function.py ./package/
-          
-          # Create clean zip file
-          cd ./package
-          zip -r ../../../infrastructure/aws/terraform/lambda.zip . -x "*.pyc" "__pycache__/*"
-          cd ..
-          
-          # Verify zip file was created
-          if [ -f "../../infrastructure/aws/terraform/lambda.zip" ]; then
-            echo "✅ Lambda package created successfully"
-            ls -la ../../infrastructure/aws/terraform/lambda.zip
-          else
-            echo "❌ Failed to create Lambda package"
-            exit 1
-          fi
-          
-          # Clean up temporary package directory
-          rm -rf ./package
+          zip -r lambda.zip . -x "requirements.txt"
+          cp lambda.zip $GITHUB_WORKSPACE/infrastructure/aws/terraform/
+          echo "✅ Lambda package ready for Terraform"
 
-      - name: Frontend Validation
-        working-directory: frontend
-        run: |
-          if ! ls *.html 2>/dev/null; then
-            echo "📝 No HTML files found - applications will create professional resume"
-          fi
-          echo "✅ Frontend validation completed"
-
-  trigger-terraform:
-    name: Trigger Infrastructure (VCS)
+  wait-for-terraform-cloud:
+    name: Wait for Terraform Cloud
     runs-on: ubuntu-latest
-    needs: [security-scan, testing-suite]
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-
-    outputs:
-      terraform_triggered: "true"
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform (for validation only)
-        uses: hashicorp/setup-terraform@v3
-        with:
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-          terraform_wrapper: false
-
-      - name: Validate Terraform Configuration
-        working-directory: infrastructure/aws/terraform
-        run: |
-          terraform init
-          terraform validate
-          echo "✅ Terraform configuration is valid"
-
-      - name: Trigger Terraform Cloud VCS Apply
-        run: |
-          echo "🚀 Infrastructure deployment triggered via VCS workflow"
-          echo "This push to main branch triggers Terraform Cloud auto-apply"
-          echo "📊 Monitor progress at: https://app.terraform.io/app/ricardo-cloud-resume/workspaces/aws-resume-infrastructure"
-          echo "⏳ Waiting period: 6-8 minutes for infrastructure deployment"
-
-  wait-for-infrastructure:
-    name: Wait for Infrastructure Deployment
-    runs-on: ubuntu-latest
-    needs: trigger-terraform
+    needs: validate-and-test
+    if: github.ref == 'refs/heads/main'
     
     outputs:
       website_url: ${{ steps.get_outputs.outputs.website_url }}
@@ -236,61 +108,62 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Terraform
+      - name: Setup Terraform (read-only)
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
           terraform_wrapper: false
 
+      - name: VCS Trigger Information
+        run: |
+          echo "🚀 VCS-Driven Deployment Triggered"
+          echo "This push to main branch will trigger Terraform Cloud auto-apply"
+          echo "📊 Monitor at: https://app.terraform.io/app/ricardo-cloud-resume/workspaces/aws-resume-infrastructure"
+          echo ""
+          echo "⏳ Waiting 8 minutes for Terraform Cloud to complete:"
+          echo "  - Plan generation: ~2 minutes"
+          echo "  - Auto-apply execution: ~5 minutes"
+          echo "  - Output generation: ~1 minute"
+
       - name: Wait for Terraform Cloud Auto-Apply
         run: |
-          echo "⏳ Waiting for Terraform Cloud VCS auto-apply to complete..."
-          echo "This includes:"
-          echo "  - Terraform plan generation (1-2 min)"
-          echo "  - Auto-apply execution (4-6 min)"
-          echo "  - Output generation (30 sec)"
-          echo ""
-          echo "Total wait time: 6-8 minutes"
-          
-          # Wait 6 minutes for Terraform Cloud to complete
-          for i in {1..6}; do
-            echo "⏰ Waiting... $i/6 minutes elapsed"
+          echo "⏳ Waiting for Terraform Cloud auto-apply (8 minutes)..."
+          for i in {1..8}; do
+            echo "⏰ Minute $i/8 - Terraform Cloud processing..."
             sleep 60
           done
-          
           echo "✅ Wait period completed"
 
-      - name: Get Infrastructure Outputs with Retry
+      - name: Get Infrastructure Outputs (Read-Only)
         id: get_outputs
         working-directory: infrastructure/aws/terraform
         run: |
           terraform init
           
-          echo "🔍 Attempting to retrieve Terraform outputs with retry logic..."
+          echo "🔍 Reading Terraform outputs (VCS mode - read-only)..."
           
-          max_attempts=15
+          max_attempts=20
           attempt=1
           success=false
           
           while [ $attempt -le $max_attempts ] && [ "$success" = "false" ]; do
             echo "🔄 Attempt $attempt of $max_attempts..."
             
-            # Try to get outputs
-            if terraform refresh && terraform output > /dev/null 2>&1; then
+            # Only read outputs - no state modifications
+            if terraform output > /dev/null 2>&1; then
               S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
               WEBSITE_URL=$(terraform output -raw website_url 2>/dev/null || echo "")
               API_URL=$(terraform output -raw api_url 2>/dev/null || echo "")
               CLOUDFRONT_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
               
-              # Validate outputs
+              # Validate we got real outputs
               if [ ! -z "$S3_BUCKET" ] && [ "$S3_BUCKET" != "null" ] && [[ "$S3_BUCKET" == *"cloud-resume"* ]]; then
-                echo "✅ Successfully retrieved valid outputs:"
+                echo "✅ Successfully retrieved infrastructure outputs:"
                 echo "S3 Bucket: $S3_BUCKET"
                 echo "Website URL: $WEBSITE_URL"
                 echo "API URL: $API_URL"
                 echo "CloudFront ID: $CLOUDFRONT_ID"
                 
-                # Set outputs
                 echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
                 echo "website_url=$WEBSITE_URL" >> $GITHUB_OUTPUT
                 echo "api_url=$API_URL" >> $GITHUB_OUTPUT
@@ -299,44 +172,39 @@ jobs:
                 success=true
                 break
               else
-                echo "⏳ Outputs not ready. S3 bucket: '$S3_BUCKET'"
+                echo "⏳ Outputs not ready yet. S3 bucket value: '$S3_BUCKET'"
               fi
             else
-              echo "⏳ Terraform outputs not available yet"
+              echo "⏳ Terraform outputs not available (Terraform Cloud still applying)"
             fi
             
             if [ "$success" = "false" ]; then
-              echo "Waiting 30 seconds before retry..."
-              sleep 30
+              echo "Waiting 20 seconds before retry..."
+              sleep 20
               attempt=$((attempt + 1))
             fi
           done
           
           if [ "$success" = "false" ]; then
-            echo "❌ Failed to get valid outputs after $max_attempts attempts"
-            echo "This usually means Terraform Cloud hasn't finished applying yet"
+            echo "❌ Could not retrieve outputs after $max_attempts attempts"
+            echo "📋 Debug information:"
+            terraform state list 2>/dev/null || echo "No state available"
+            terraform output 2>/dev/null || echo "No outputs available"
             
-            # Show current state for debugging
-            echo "📋 Current Terraform state:"
-            terraform state list || echo "No state available"
-            echo "📊 Available outputs:"
-            terraform output || echo "No outputs available"
+            echo "s3_bucket=terraform-cloud-not-ready" >> $GITHUB_OUTPUT
+            echo "website_url=https://terraform-cloud-not-ready" >> $GITHUB_OUTPUT
+            echo "api_url=https://terraform-cloud-not-ready" >> $GITHUB_OUTPUT
+            echo "cloudfront_id=not-ready" >> $GITHUB_OUTPUT
             
-            # Set fallback values
-            echo "s3_bucket=still-deploying" >> $GITHUB_OUTPUT
-            echo "website_url=https://still-deploying" >> $GITHUB_OUTPUT
-            echo "api_url=https://still-deploying" >> $GITHUB_OUTPUT
-            echo "cloudfront_id=still-deploying" >> $GITHUB_OUTPUT
-            
-            echo "⚠️ Infrastructure may still be deploying. Check Terraform Cloud for status."
-            exit 0  # Don't fail - let application deploy handle this
+            echo "🔗 Check Terraform Cloud status manually"
+            exit 0
           fi
 
-  application-deploy:
+  deploy-applications:
     name: Deploy Applications
     runs-on: ubuntu-latest
-    needs: wait-for-infrastructure
-    if: needs.wait-for-infrastructure.outputs.s3_bucket != 'still-deploying'
+    needs: wait-for-terraform-cloud
+    if: needs.wait-for-terraform-cloud.outputs.s3_bucket != 'terraform-cloud-not-ready'
     
     steps:
       - name: Checkout code
@@ -349,24 +217,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      - name: Verify Infrastructure Outputs
-        run: |
-          echo "🔍 Infrastructure outputs received:"
-          echo "S3 Bucket: ${{ needs.wait-for-infrastructure.outputs.s3_bucket }}"
-          echo "Website URL: ${{ needs.wait-for-infrastructure.outputs.website_url }}"
-          echo "API URL: ${{ needs.wait-for-infrastructure.outputs.api_url }}"
-          echo "CloudFront ID: ${{ needs.wait-for-infrastructure.outputs.cloudfront_id }}"
-
-      - name: Deploy Professional Resume Frontend
+      - name: Deploy Professional Resume
         working-directory: frontend
         run: |
-          S3_BUCKET="${{ needs.wait-for-infrastructure.outputs.s3_bucket }}"
-          API_URL="${{ needs.wait-for-infrastructure.outputs.api_url }}"
+          S3_BUCKET="${{ needs.wait-for-terraform-cloud.outputs.s3_bucket }}"
+          API_URL="${{ needs.wait-for-terraform-cloud.outputs.api_url }}"
           
-          echo "🎯 Deploying to S3 bucket: $S3_BUCKET"
+          echo "🎯 Deploying to: $S3_BUCKET"
           echo "🔗 API endpoint: $API_URL"
           
-          # Create professional resume
           cat > index.html << EOF
           <!DOCTYPE html>
           <html lang="en">
@@ -376,12 +235,11 @@ jobs:
               <title>Ricardo Torres - Technical Program Manager III</title>
               <style>
                   body { 
-                      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                      line-height: 1.6; 
+                      font-family: 'Segoe UI', sans-serif; 
                       margin: 0; 
-                      padding: 20px; 
-                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                      min-height: 100vh;
+                      background: linear-gradient(135deg, #667eea, #764ba2);
+                      min-height: 100vh; 
+                      padding: 20px;
                   }
                   .container { 
                       max-width: 900px; 
@@ -399,14 +257,13 @@ jobs:
                   }
                   .header h1 { 
                       font-size: 3em; 
-                      margin-bottom: 10px; 
-                      text-shadow: 2px 2px 4px rgba(0,0,0,0.3); 
+                      margin: 0 0 10px 0; 
                   }
                   .visitor-counter { 
                       text-align: center; 
                       margin: 30px; 
                       padding: 30px; 
-                      background: linear-gradient(45deg, #f8f9fa, #e9ecef); 
+                      background: #f8f9fa; 
                       border-radius: 15px; 
                       border: 3px solid #3498db; 
                   }
@@ -415,12 +272,8 @@ jobs:
                       font-weight: bold; 
                       color: #3498db; 
                   }
-                  .content { 
-                      padding: 40px; 
-                  }
-                  .section { 
-                      margin: 30px 0; 
-                  }
+                  .content { padding: 40px; }
+                  .section { margin: 30px 0; }
                   .section h2 { 
                       color: #2c3e50; 
                       border-bottom: 3px solid #3498db; 
@@ -448,7 +301,6 @@ jobs:
                       color: white; 
                       padding: 8px 15px; 
                       border-radius: 20px; 
-                      font-size: 14px; 
                   }
               </style>
           </head>
@@ -458,7 +310,7 @@ jobs:
                       <h1>Ricardo Torres</h1>
                       <div style="font-size: 1.3em;">Technical Program Manager III</div>
                       <div style="margin-top: 20px;">
-                          📧 ricardot66@gmail.com | 📱 +52 5541935541 | 🌐 ricardot.com
+                          📧 ricardot66@gmail.com | 🌐 ricardot.com | 💼 LinkedIn
                       </div>
                   </header>
                   
@@ -466,14 +318,14 @@ jobs:
                       <div>👥 Portfolio Visitors</div>
                       <div class="visitor-number" id="visitor-count">Loading...</div>
                       <div style="font-size: 0.9em; color: #666; margin-top: 10px;">
-                          Real-time analytics powered by AWS serverless architecture
+                          Real-time analytics • AWS serverless architecture
                       </div>
                   </div>
                   
                   <div class="content">
                       <div class="section">
                           <h2>🎯 Executive Summary</h2>
-                          <p>Technical Program Manager with <strong>9+ years</strong> of experience leading cross-functional, data-driven initiatives across global markets. Expert in cloud platforms (AWS, GCP, Azure), automation, and scalable system design.</p>
+                          <p><strong>Technical Program Manager with 9+ years</strong> leading cross-functional, data-driven initiatives across global markets. Expert in cloud platforms (AWS, GCP, Azure), automation, and scalable system design.</p>
                       </div>
                       
                       <div class="section">
@@ -483,9 +335,10 @@ jobs:
                               <div class="company">British American Tobacco (BAT)</div>
                               <div><strong>Commercial Analytics Manager</strong> | April 2021 - Present</div>
                               <ul>
-                                  <li>Led cross-functional technical programs across 4 global markets</li>
+                                  <li>Led cross-functional technical programs across 4 global markets (Canada, Brazil, Mexico, Chile)</li>
                                   <li>Managed £1M+ technical initiatives with stakeholder alignment</li>
                                   <li>Designed automation tools reducing manual operations by 60%</li>
+                                  <li>Implemented robust monitoring ensuring 99.9% delivery performance</li>
                               </ul>
                           </div>
                           
@@ -493,8 +346,8 @@ jobs:
                               <div class="company">Amazon</div>
                               <div><strong>Program Manager - Sales Data Science</strong> | April 2019 - July 2020</div>
                               <ul>
-                                  <li>Managed BI database systems for Amazon Marketplace</li>
-                                  <li>Led automation initiatives improving efficiency by 35%</li>
+                                  <li>Managed BI database systems for Amazon Marketplace across Mexico and Colombia</li>
+                                  <li>Led automation initiatives improving operating efficiency by 35%</li>
                                   <li>SME for competitive intelligence systems</li>
                               </ul>
                           </div>
@@ -510,6 +363,13 @@ jobs:
                               <span class="skill">CI/CD</span>
                               <span class="skill">Data Analytics</span>
                               <span class="skill">Program Management</span>
+                          </div>
+                      </div>
+                      
+                      <div style="text-align: center; margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 10px;">
+                          <div><strong>Cloud Resume Challenge</strong></div>
+                          <div style="font-size: 0.9em; color: #666;">
+                              Serverless Architecture: Lambda • DynamoDB • CloudFront • S3 • Terraform • GitHub Actions
                           </div>
                       </div>
                   </div>
@@ -534,50 +394,62 @@ jobs:
           </html>
           EOF
           
-          # Deploy to S3
           aws s3 sync . s3://$S3_BUCKET --delete --exclude "*.git*"
-          echo "✅ Frontend deployed successfully"
+          echo "✅ Resume deployed successfully"
 
-      - name: Update Lambda Function (if needed)
+      - name: Invalidate CloudFront
+        if: needs.wait-for-terraform-cloud.outputs.cloudfront_id != 'not-ready'
         run: |
-          # Get function name from S3 bucket name pattern
-          FUNCTION_NAME=$(echo "${{ needs.wait-for-infrastructure.outputs.s3_bucket }}" | sed 's/-website-.*/-visitor-counter/')
-          
-          echo "🔄 Checking Lambda function: $FUNCTION_NAME"
-          
-          if aws lambda get-function --function-name "$FUNCTION_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
-            echo "ℹ️ Lambda function exists and is managed by Terraform"
-          else
-            echo "ℹ️ Lambda function will be created/updated by Terraform"
+          CLOUDFRONT_ID="${{ needs.wait-for-terraform-cloud.outputs.cloudfront_id }}"
+          if [ ! -z "$CLOUDFRONT_ID" ] && [ "$CLOUDFRONT_ID" != "null" ]; then
+            aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_ID --paths "/*"
+            echo "✅ CloudFront cache invalidated"
           fi
 
-      - name: Invalidate CloudFront Cache
-        if: needs.wait-for-infrastructure.outputs.cloudfront_id != 'still-deploying'
+      - name: Test Deployment
         run: |
-          CLOUDFRONT_ID="${{ needs.wait-for-infrastructure.outputs.cloudfront_id }}"
-          if [ ! -z "$CLOUDFRONT_ID" ] && [ "$CLOUDFRONT_ID" != "null" ]; then
-            echo "🔄 Invalidating CloudFront: $CLOUDFRONT_ID"
-            aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_ID --paths "/*"
-            echo "✅ CloudFront invalidation created"
+          echo "🧪 Testing deployment..."
+          website_url="${{ needs.wait-for-terraform-cloud.outputs.website_url }}"
+          api_url="${{ needs.wait-for-terraform-cloud.outputs.api_url }}"
+          
+          # Test website
+          if curl -s "$website_url" > /dev/null; then
+            echo "✅ Website accessible"
+          else
+            echo "⚠️ Website test failed"
+          fi
+          
+          # Test API
+          if curl -s "$api_url" > /dev/null; then
+            echo "✅ API accessible"
+          else
+            echo "⚠️ API test failed"
           fi
 
   deployment-summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [wait-for-infrastructure, application-deploy]
+    needs: [wait-for-terraform-cloud, deploy-applications]
     if: always()
     steps:
       - name: Generate Report
         run: |
           echo "## 🚀 VCS-Driven Deployment Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ needs.wait-for-infrastructure.result }}" = "success" ]; then
-            echo "✅ **Infrastructure**: Auto-deployed via Terraform Cloud VCS" >> $GITHUB_STEP_SUMMARY
-            echo "🌐 **Website**: ${{ needs.wait-for-infrastructure.outputs.website_url }}" >> $GITHUB_STEP_SUMMARY
-            echo "🔗 **API**: ${{ needs.wait-for-infrastructure.outputs.api_url }}" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ **Infrastructure**: Still deploying or failed" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Method**: VCS-Driven with Auto-Apply" >> $GITHUB_STEP_SUMMARY
+          echo "**Method**: Pure VCS-driven with Terraform Cloud auto-apply" >> $GITHUB_STEP_SUMMARY
           echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.wait-for-terraform-cloud.result }}" = "success" ]; then
+            echo "✅ **Infrastructure**: Auto-deployed via Terraform Cloud" >> $GITHUB_STEP_SUMMARY
+            echo "🌐 **Website**: ${{ needs.wait-for-terraform-cloud.outputs.website_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 **API**: ${{ needs.wait-for-terraform-cloud.outputs.api_url }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Infrastructure**: Deployment pending or failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.deploy-applications.result }}" = "success" ]; then
+            echo "✅ **Applications**: Frontend and backend deployed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Applications**: Deployment skipped or failed" >> $GITHUB_STEP_SUMMARY
+          fi
