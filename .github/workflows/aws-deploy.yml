@@ -31,12 +31,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Checkov Security Scan
+      - name: Run Checkov (Infrastructure Security)
         uses: bridgecrewio/checkov-action@master
         with:
           directory: infrastructure/aws/terraform
           framework: terraform
-	  config_file: .checkov.yml
+          config_file: .checkov.yml
 
       - name: Python Security Scan
         working-directory: backend/lambda
