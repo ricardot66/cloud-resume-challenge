@@ -36,6 +36,7 @@ jobs:
         with:
           directory: infrastructure/aws/terraform
           framework: terraform
+	  config_file: .checkov.yml
 
       - name: Python Security Scan
         working-directory: backend/lambda
