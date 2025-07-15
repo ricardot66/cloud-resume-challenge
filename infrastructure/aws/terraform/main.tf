@@ -324,7 +324,33 @@ resource "aws_wafv2_web_acl" "website" {
     metric_name                = "WebACL"
     sampled_requests_enabled   = true
   }
+  # Amazon IP Reputation List for enhanced protection
+  rule {
+    name     = "AWSManagedRulesAmazonIpReputationList"
+    priority = 4
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesAmazonIpReputationList"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AmazonIpReputationListMetric"
+      sampled_requests_enabled   = true
+    }
+  }
+
 }
+
+
+
 
 # WAF Logging Configuration
 resource "aws_wafv2_web_acl_logging_configuration" "website" {
@@ -906,4 +932,10 @@ resource "aws_default_security_group" "default" {
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-default-sg-restricted"
   })
+}
+
+# Associate WAF with API Gateway for protection
+resource "aws_wafv2_web_acl_association" "api_gateway" {
+  resource_arn = aws_api_gateway_stage.visitor_counter.arn
+  web_acl_arn  = aws_wafv2_web_acl.website.arn
 }
