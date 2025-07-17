@@ -135,3 +135,4 @@ output "interview_talking_points" {
     program_management = "Balanced stakeholder requirements (security, cost, performance) effectively"
   }
 }
+# Refresh outputs Thu Jul 17 15:42:54 PDT 2025
