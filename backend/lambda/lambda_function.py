@@ -15,7 +15,7 @@ def lambda_handler(event, context):
     try:
         # Atomic counter update using UpdateItem
         response = table.update_item(
-            Key={'id': 'visitors'},
+            Key={'id': 'visitors-count'},
             UpdateExpression='ADD #count :incr',
             ExpressionAttributeNames={
                 '#count': 'count'
