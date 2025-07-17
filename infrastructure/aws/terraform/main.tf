@@ -23,7 +23,7 @@ resource "aws_kms_key" "main" {
         Sid    = "Allow CloudWatch Logs"
         Effect = "Allow"
         Principal = {
-          Service = "logs.${data.aws_region.current.name}.amazonaws.com"
+          Service = "logs.amazonaws.com"
         }
         Action = [
           "kms:Encrypt",
@@ -209,8 +209,16 @@ resource "aws_s3_bucket_lifecycle_configuration" "website" {
   bucket = aws_s3_bucket.website.id
 
   rule {
-    id     = "abort_incomplete_multipart_uploads"
+    id     = "website_lifecycle"
     status = "Enabled"
+
+    filter {
+      prefix = ""
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
@@ -218,13 +226,25 @@ resource "aws_s3_bucket_lifecycle_configuration" "website" {
   }
 
   rule {
-    id     = "delete_old_versions"
+    id     = "old_versions_cleanup"
     status = "Enabled"
 
-    noncurrent_version_expiration {
+    filter {
+      prefix = ""
+    }
+
+    noncurrent_version_transition {
       noncurrent_days = 30
+      storage_class   = "STANDARD_IA"
+    }
+
+    noncurrent_version_transition {
+      noncurrent_days = 90
+      storage_class   = "GLACIER"
     }
   }
+
+  depends_on = [aws_s3_bucket_versioning.website]
 }
 
 # CloudFront Origin Access Control
@@ -238,21 +258,19 @@ resource "aws_cloudfront_origin_access_control" "website" {
 
 # WAF with Logging Configuration
 resource "aws_wafv2_web_acl" "website" {
-  name  = "${local.name_prefix}-waf"
+  name  = "${var.project_name}-${var.environment}-waf"
   scope = "CLOUDFRONT"
-  tags  = local.common_tags
 
   default_action {
     allow {}
   }
 
-  # Rate limiting rule
   rule {
     name     = "RateLimitRule"
     priority = 1
 
-    override_action {
-      none {}
+    action {
+      block {}
     }
 
     statement {
@@ -267,13 +285,8 @@ resource "aws_wafv2_web_acl" "website" {
       metric_name                = "RateLimitRule"
       sampled_requests_enabled   = true
     }
-
-    action {
-      block {}
-    }
   }
 
-  # AWS Managed Rules
   rule {
     name     = "AWSManagedRulesCommonRuleSet"
     priority = 2
@@ -296,7 +309,6 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
-  # Log4j protection rule
   rule {
     name     = "AWSManagedRulesKnownBadInputsRuleSet"
     priority = 3
@@ -319,12 +331,6 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
-  visibility_config {
-    cloudwatch_metrics_enabled = true
-    metric_name                = "WebACL"
-    sampled_requests_enabled   = true
-  }
-  # Amazon IP Reputation List for enhanced protection
   rule {
     name     = "AWSManagedRulesAmazonIpReputationList"
     priority = 4
@@ -347,10 +353,14 @@ resource "aws_wafv2_web_acl" "website" {
     }
   }
 
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.project_name}${var.environment}WebACL"
+    sampled_requests_enabled   = true
+  }
+
+  tags = local.common_tags
 }
-
-
-
 
 # WAF Logging Configuration
 resource "aws_wafv2_web_acl_logging_configuration" "website" {
@@ -505,6 +515,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "failover_website" {
   rule {
     id     = "abort_incomplete_multipart_uploads"
     status = "Enabled"
+
+    filter {
+      prefix = ""
+    }
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
@@ -672,25 +686,17 @@ resource "aws_sqs_queue" "lambda_dlq" {
 
 # Lambda Function with Cost-Optimized Security
 resource "aws_lambda_function" "visitor_counter" {
-  filename      = "lambda.zip"
-  function_name = "${local.name_prefix}-visitor-counter"
+  function_name = "${var.project_name}-${var.environment}-visitor-counter"
   role          = aws_iam_role.lambda_execution.arn
   handler       = "lambda_function.lambda_handler"
   runtime       = "python3.9"
-  timeout       = var.lambda_timeout
-  memory_size   = var.lambda_memory_size
+  timeout       = 30
+  memory_size   = 128
 
-  # Dead Letter Queue Configuration (CKV_AWS_116)
-  dead_letter_config {
-    target_arn = aws_sqs_queue.lambda_dlq.arn
-  }
+  # Create deployment package
+  filename         = "${path.module}/lambda_function.zip"
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
-  # X-Ray Tracing
-  tracing_config {
-    mode = "Active"
-  }
-
-  # Environment variables with KMS encryption
   environment {
     variables = {
       DYNAMODB_TABLE = aws_dynamodb_table.visitor_count.name
@@ -698,17 +704,46 @@ resource "aws_lambda_function" "visitor_counter" {
     }
   }
 
+  # Error handling
+  dead_letter_config {
+    target_arn = aws_sqs_queue.lambda_dlq.arn
+  }
+
+  # Tracing
+  tracing_config {
+    mode = "Active"
+  }
+
+  # KMS encryption
   kms_key_arn = aws_kms_key.main.arn
 
   # Enable function-level concurrency control
   reserved_concurrent_executions = 10
 
-  tags = local.common_tags
-
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic,
-    aws_cloudwatch_log_group.lambda_logs
+    aws_iam_role_policy.lambda_dynamodb,
+    aws_cloudwatch_log_group.lambda_logs,
+    data.archive_file.lambda_zip
   ]
+
+  tags = local.common_tags
+}
+
+# Add data source for creating Lambda zip
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  output_path = "${path.module}/lambda_function.zip"
+
+  source {
+    content  = file("${path.module}/../../../backend/lambda/lambda_function.py")
+    filename = "lambda_function.py"
+  }
+
+  source {
+    content  = file("${path.module}/../../../backend/lambda/requirements.txt")
+    filename = "requirements.txt"
+  }
 }
 
 # Add SQS permissions to Lambda role
@@ -729,7 +764,6 @@ resource "aws_iam_role_policy" "lambda_sqs" {
     ]
   })
 }
-
 
 # API Gateway with Security and Caching
 resource "aws_api_gateway_rest_api" "visitor_counter" {
@@ -795,13 +829,14 @@ resource "aws_api_gateway_integration_response" "count_options" {
   rest_api_id = aws_api_gateway_rest_api.visitor_counter.id
   resource_id = aws_api_gateway_resource.count.id
   http_method = aws_api_gateway_method.count_options.http_method
-  status_code = aws_api_gateway_method_response.count_options.status_code
+  status_code = "200"
 
   response_parameters = {
     "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
     "method.response.header.Access-Control-Allow-Methods" = "'GET,OPTIONS'"
     "method.response.header.Access-Control-Allow-Origin"  = "'*'"
   }
+  depends_on = [aws_api_gateway_integration.count_options]
 }
 
 resource "aws_api_gateway_deployment" "visitor_counter" {
@@ -957,9 +992,6 @@ resource "aws_wafv2_web_acl_association" "api_gateway" {
   web_acl_arn  = aws_wafv2_web_acl.website.arn
 }
 
-
-
-
 # S3 bucket for access logs (required for logging)
 resource "aws_s3_bucket" "access_logs" {
   bucket = "${local.name_prefix}-access-logs-${random_string.bucket_suffix.result}"
@@ -994,6 +1026,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "access_logs" {
     id     = "delete_old_logs"
     status = "Enabled"
 
+    filter {
+      prefix = ""
+    }
+
     expiration {
       days = 90
     }
@@ -1026,5 +1062,6 @@ resource "aws_s3_bucket_versioning" "access_logs" {
     status = "Enabled"
   }
 }
+
 # Updated Mon Jul 14 21:52:49 CST 2025
 # Auto-apply enabled Wed Jul 16 15:05:17 CST 2025
