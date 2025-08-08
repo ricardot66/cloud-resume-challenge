@@ -2,14 +2,33 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_caller_identity" "current" {}
+
 resource "aws_sqs_queue" "lambda_dlq" {
   name = "lambda-dlq"
+  kms_master_key_id = aws_kms_key.dynamodb_kms.id
+  kms_data_key_reuse_period_seconds = 300
 }
 
 resource "aws_kms_key" "dynamodb_kms" {
   description             = "CMK for DynamoDB encryption"
   deletion_window_in_days = 10
   enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action = "kms:*",
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 resource "aws_dynamodb_table" "visitor_count" {
@@ -48,7 +67,14 @@ resource "aws_lambda_function" "visitor_counter" {
   dead_letter_config {
     target_arn = aws_sqs_queue.lambda_dlq.arn
   }
-}
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  reserved_concurrent_executions = 10
+
+  kms_key_arn = aws_kms_key.dynamodb_kms.arn
 
 resource "aws_iam_role" "lambda_exec" {
   name = "lambda_exec_role"
@@ -65,6 +91,34 @@ resource "aws_iam_role" "lambda_exec" {
       }
     ]
   })
+}
+
+resource "aws_cloudfront_response_headers_policy" "security_headers" {
+  name = "security-headers-policy"
+  security_headers_config {
+    content_security_policy {
+      override = true
+      content_security_policy = "default-src 'self';"
+    }
+    strict_transport_security {
+      override = true
+      access_control_max_age_sec = 31536000
+      include_subdomains = true
+      preload = true
+    }
+    xss_protection {
+      override = true
+      protection = true
+      mode_block = true
+    }
+    content_type_options {
+      override = true
+    }
+    referrer_policy {
+      override = true
+      referrer_policy = "strict-origin-when-cross-origin"
+    }
+  }
 }
 
 resource "aws_cloudfront_distribution" "website_distribution" {
@@ -95,6 +149,7 @@ resource "aws_cloudfront_distribution" "website_distribution" {
     }
 
     viewer_protocol_policy = "redirect-to-https"
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
   }
 
   viewer_certificate {
@@ -144,6 +199,10 @@ resource "aws_s3_bucket" "website" {
   acl           = "private"
   force_destroy = true
 
+  versioning {
+    enabled = true
+  }
+
   website {
     index_document = "index.html"
     error_document = "error.html"
@@ -155,6 +214,10 @@ resource "aws_s3_bucket" "backup" {
 
   acl           = "private"
   force_destroy = true
+
+  versioning {
+    enabled = true
+  }
 
   website {
     index_document = "index.html"
@@ -184,6 +247,10 @@ resource "aws_s3_bucket" "logs" {
   bucket        = "cloud-resume-dev-logs"
   force_destroy = true
   acl           = "log-delivery-write"
+
+  versioning {
+    enabled = true
+  }
 }
 
 resource "aws_wafv2_web_acl" "resume_acl" {
@@ -213,6 +280,34 @@ resource "aws_wafv2_web_acl" "resume_acl" {
     visibility_config {
       cloudwatch_metrics_enabled = false
       metric_name                = "aws-managed-common-rules"
+      sampled_requests_enabled   = false
+    }
+  }
+
+  rule {
+    name     = "AWS-AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+        rule_action_override {
+          action_to_use {
+            block {}
+          }
+          name = "Log4jCVE-2021-44228"
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = false
+      metric_name                = "aws-managed-bad-inputs"
       sampled_requests_enabled   = false
     }
   }
