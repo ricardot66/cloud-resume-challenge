@@ -75,6 +75,7 @@ resource "aws_lambda_function" "visitor_counter" {
   reserved_concurrent_executions = 10
 
   kms_key_arn = aws_kms_key.dynamodb_kms.arn
+}
 
 resource "aws_iam_role" "lambda_exec" {
   name = "lambda_exec_role"
