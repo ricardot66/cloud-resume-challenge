@@ -115,6 +115,52 @@ resource "aws_iam_role" "lambda_exec" {
   })
 }
 
+resource "aws_iam_policy" "dynamodb_policy" {
+  name        = "dynamodb-policy"
+  description = "Policy for DynamoDB access"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ],
+        Resource = aws_dynamodb_table.visitor_count.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "sqs_policy" {
+  name        = "sqs-policy"
+  description = "Policy for SQS access"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = "sqs:SendMessage",
+        Resource = aws_sqs_queue.lambda_dlq.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "dynamodb_attachment" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = aws_iam_policy.dynamodb_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "sqs_attachment" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = aws_iam_policy.sqs_policy.arn
+}
+
 resource "aws_cloudfront_response_headers_policy" "security_headers" {
   name = "security-headers-policy"
   security_headers_config {
