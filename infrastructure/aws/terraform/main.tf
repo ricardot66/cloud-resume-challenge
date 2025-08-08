@@ -200,13 +200,16 @@ resource "aws_s3_bucket" "website" {
   acl           = "private"
   force_destroy = true
 
-  versioning {
-    enabled = true
-  }
-
   website {
     index_document = "index.html"
     error_document = "error.html"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "website" {
+  bucket = aws_s3_bucket.website.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
@@ -216,13 +219,16 @@ resource "aws_s3_bucket" "backup" {
   acl           = "private"
   force_destroy = true
 
-  versioning {
-    enabled = true
-  }
-
   website {
     index_document = "index.html"
     error_document = "error.html"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
@@ -248,9 +254,12 @@ resource "aws_s3_bucket" "logs" {
   bucket        = "cloud-resume-dev-logs"
   force_destroy = true
   acl           = "log-delivery-write"
+}
 
-  versioning {
-    enabled = true
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
