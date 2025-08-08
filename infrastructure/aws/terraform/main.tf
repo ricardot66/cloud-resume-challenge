@@ -31,6 +31,27 @@ resource "aws_kms_key" "dynamodb_kms" {
   })
 }
 
+resource "aws_kms_key" "lambda_kms" {
+  description             = "CMK for Lambda encryption"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions",
+        Effect = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        },
+        Action = "kms:*",
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_dynamodb_table" "visitor_count" {
   name         = "cloud-resume-dev-visitor-count"
   billing_mode = "PAY_PER_REQUEST"
@@ -74,7 +95,7 @@ resource "aws_lambda_function" "visitor_counter" {
 
   reserved_concurrent_executions = 10
 
-  kms_key_arn = aws_kms_key.dynamodb_kms.arn
+  kms_key_arn = aws_kms_key.lambda_kms.arn
 }
 
 resource "aws_iam_role" "lambda_exec" {
@@ -197,12 +218,23 @@ resource "aws_cloudfront_origin_access_identity" "oai" {
 resource "aws_s3_bucket" "website" {
   bucket = "cloud-resume-dev-website-3ikujxky"
 
-  acl           = "private"
   force_destroy = true
+}
 
-  website {
-    index_document = "index.html"
-    error_document = "error.html"
+resource "aws_s3_bucket_acl" "website" {
+  bucket = aws_s3_bucket.website.id
+  acl    = "private"
+}
+
+resource "aws_s3_bucket_website_configuration" "website" {
+  bucket = aws_s3_bucket.website.id
+
+  index_document {
+    suffix = "index.html"
+  }
+
+  error_document {
+    key = "error.html"
   }
 }
 
@@ -216,12 +248,23 @@ resource "aws_s3_bucket_versioning" "website" {
 resource "aws_s3_bucket" "backup" {
   bucket = "cloud-resume-dev-website-backup-3ikujxky"
 
-  acl           = "private"
   force_destroy = true
+}
 
-  website {
-    index_document = "index.html"
-    error_document = "error.html"
+resource "aws_s3_bucket_acl" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  acl    = "private"
+}
+
+resource "aws_s3_bucket_website_configuration" "backup" {
+  bucket = aws_s3_bucket.backup.id
+
+  index_document {
+    suffix = "index.html"
+  }
+
+  error_document {
+    key = "error.html"
   }
 }
 
@@ -253,7 +296,11 @@ resource "aws_s3_bucket_policy" "website_policy" {
 resource "aws_s3_bucket" "logs" {
   bucket        = "cloud-resume-dev-logs"
   force_destroy = true
-  acl           = "log-delivery-write"
+}
+
+resource "aws_s3_bucket_acl" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  acl    = "log-delivery-write"
 }
 
 resource "aws_s3_bucket_versioning" "logs" {
