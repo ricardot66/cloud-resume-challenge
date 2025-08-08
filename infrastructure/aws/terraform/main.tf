@@ -2,50 +2,90 @@ provider "aws" {
   region = var.aws_region
 }
 
-provider "archive" {}
+resource "aws_sqs_queue" "lambda_dlq" {
+  name = "lambda-dlq"
+}
 
-resource "aws_s3_bucket" "resume_bucket" {
-  bucket = var.s3_bucket_name
-  acl    = "public-read"
+resource "aws_kms_key" "dynamodb_kms" {
+  description             = "CMK for DynamoDB encryption"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+}
 
-  website {
-    index_document = "index.html"
-    error_document = "error.html"
+resource "aws_dynamodb_table" "visitor_count" {
+  name         = "cloud-resume-dev-visitor-count"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id"
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.dynamodb_kms.arn
   }
 }
 
-resource "aws_s3_bucket_policy" "resume_bucket_policy" {
-  bucket = aws_s3_bucket.resume_bucket.id
+resource "aws_lambda_function" "visitor_counter" {
+  function_name = "visitor-counter"
+  handler       = "lambda_function.lambda_handler"
+  runtime       = "python3.11"
+  role          = aws_iam_role.lambda_exec.arn
+  filename      = "lambda_function.zip"
 
-  policy = jsonencode({
+  environment {
+    variables = {
+      TABLE_NAME = aws_dynamodb_table.visitor_count.name
+    }
+  }
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.lambda_dlq.arn
+  }
+}
+
+resource "aws_iam_role" "lambda_exec" {
+  name = "lambda_exec_role"
+
+  assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
       {
-        Sid       = "PublicReadGetObject",
-        Effect    = "Allow",
-        Principal = "*",
-        Action    = "s3:GetObject",
-        Resource  = "${aws_s3_bucket.resume_bucket.arn}/*"
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
       }
     ]
   })
 }
 
-resource "aws_cloudfront_distribution" "website" {
+resource "aws_cloudfront_distribution" "website_distribution" {
   origin {
-    domain_name = aws_s3_bucket.resume_bucket.website_endpoint
-    origin_id   = "S3-${aws_s3_bucket.resume_bucket.id}"
+    domain_name = aws_s3_bucket.website.bucket_regional_domain_name
+    origin_id   = "s3-origin"
+
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.oai.cloudfront_access_identity_path
+    }
   }
 
   enabled             = true
   is_ipv6_enabled     = true
-  comment             = "CloudFront distribution for static website"
+  comment             = "Cloud Resume website"
   default_root_object = "index.html"
 
   default_cache_behavior {
     allowed_methods  = ["GET", "HEAD"]
     cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "S3-${aws_s3_bucket.resume_bucket.id}"
+    target_origin_id = "s3-origin"
 
     forwarded_values {
       query_string = false
@@ -57,162 +97,130 @@ resource "aws_cloudfront_distribution" "website" {
     viewer_protocol_policy = "redirect-to-https"
   }
 
+  viewer_certificate {
+    cloudfront_default_certificate = true
+    minimum_protocol_version       = "TLSv1.2_2021"
+  }
+
   restrictions {
     geo_restriction {
-      restriction_type = "none"
+      restriction_type = "whitelist"
+      locations        = ["US", "CA"]
     }
   }
 
-  viewer_certificate {
-    cloudfront_default_certificate = true
+  logging_config {
+    include_cookies = false
+    bucket          = aws_s3_bucket.logs.bucket_domain_name
+    prefix          = "cloudfront/"
+  }
+
+  web_acl_id = aws_wafv2_web_acl.resume_acl.arn
+
+  origin_group {
+    origin_id = "origin-group-1"
+
+    failover_criteria {
+      status_codes = [403, 404, 500, 502, 503, 504]
+    }
+
+    member {
+      origin_id = "s3-origin"
+    }
+
+    member {
+      origin_id = aws_s3_bucket.backup.id
+    }
   }
 }
 
-resource "aws_dynamodb_table" "visitor_count" {
-  name         = var.dynamodb_table_name
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "id"
+resource "aws_cloudfront_origin_access_identity" "oai" {
+  comment = "OAI for S3 Cloud Resume"
+}
 
-  attribute {
-    name = "id"
-    type = "S"
+resource "aws_s3_bucket" "website" {
+  bucket = "cloud-resume-dev-website-3ikujxky"
+
+  acl           = "private"
+  force_destroy = true
+
+  website {
+    index_document = "index.html"
+    error_document = "error.html"
   }
 }
 
-resource "aws_iam_role" "lambda_exec_role" {
-  name = "lambda_exec_role"
+resource "aws_s3_bucket" "backup" {
+  bucket = "cloud-resume-dev-website-backup-3ikujxky"
 
-  assume_role_policy = jsonencode({
+  acl           = "private"
+  force_destroy = true
+
+  website {
+    index_document = "index.html"
+    error_document = "error.html"
+  }
+}
+
+resource "aws_s3_bucket_policy" "website_policy" {
+  bucket = aws_s3_bucket.website.id
+
+  policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
       {
-        Action = "sts:AssumeRole",
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        },
         Effect = "Allow",
-        Sid    = ""
+        Principal = {
+          AWS = aws_cloudfront_origin_access_identity.oai.iam_arn
+        },
+        Action   = "s3:GetObject",
+        Resource = "${aws_s3_bucket.website.arn}/*"
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_policy_attach" {
-  role       = aws_iam_role.lambda_exec_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+resource "aws_s3_bucket" "logs" {
+  bucket        = "cloud-resume-dev-logs"
+  force_destroy = true
+  acl           = "log-delivery-write"
 }
 
-resource "aws_lambda_function" "visitor_counter" {
-  function_name = "visitor_counter"
-  role          = aws_iam_role.lambda_exec_role.arn
-  handler       = "lambda_function.lambda_handler"
-  runtime       = "python3.8"
-
-  filename         = "lambda_function_payload.zip"
-  source_code_hash = filebase64sha256("lambda_function_payload.zip")
-
-  environment {
-    variables = {
-      DYNAMODB_TABLE_NAME = aws_dynamodb_table.visitor_count.name
-    }
-  }
-}
-
-resource "aws_api_gateway_rest_api" "visitor_counter_api" {
-  name        = "VisitorCounterAPI"
-  description = "API Gateway for the visitor counter Lambda"
-}
-
-resource "aws_api_gateway_resource" "visitor_counter_resource" {
-  rest_api_id = aws_api_gateway_rest_api.visitor_counter_api.id
-  parent_id   = aws_api_gateway_rest_api.visitor_counter_api.root_resource_id
-  path_part   = "visitors"
-}
-
-resource "aws_api_gateway_method" "visitor_counter_method" {
-  rest_api_id   = aws_api_gateway_rest_api.visitor_counter_api.id
-  resource_id   = aws_api_gateway_resource.visitor_counter_resource.id
-  http_method   = "GET"
-  authorization = "NONE"
-}
-
-resource "aws_api_gateway_integration" "lambda_integration" {
-  rest_api_id = aws_api_gateway_rest_api.visitor_counter_api.id
-  resource_id = aws_api_gateway_resource.visitor_counter_resource.id
-  http_method = aws_api_gateway_method.visitor_counter_method.http_method
-
-  integration_http_method = "POST"
-  type                    = "AWS_PROXY"
-  uri                     = aws_lambda_function.visitor_counter.invoke_arn
-}
-
-resource "aws_lambda_permission" "api_gateway_permission" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.visitor_counter.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_api_gateway_rest_api.visitor_counter_api.execution_arn}/*/*"
-}
-
-resource "aws_api_gateway_deployment" "visitor_counter_deployment" {
-  depends_on = [
-    aws_api_gateway_integration.lambda_integration
-  ]
-
-  rest_api_id = aws_api_gateway_rest_api.visitor_counter_api.id
-  stage_name  = "dev"
-}
-
-resource "aws_api_gateway_stage" "visitor_counter" {
-  rest_api_id = aws_api_gateway_rest_api.visitor_counter_api.id
-  deployment_id = aws_api_gateway_deployment.visitor_counter_deployment.id
-  stage_name = "dev"
-}
-
-resource "aws_wafv2_web_acl" "website_acl" {
-  name        = "cloud-resume-dev-waf"
+resource "aws_wafv2_web_acl" "resume_acl" {
+  name        = "resume-acl"
+  description = "WAF ACL for Cloud Resume Challenge"
   scope       = "CLOUDFRONT"
-  description = "WAF ACL for the Cloud Resume Challenge"
+
   default_action {
     allow {}
   }
 
-  visibility_config {
-    cloudwatch_metrics_enabled = true
-    metric_name                = "webACL"
-    sampled_requests_enabled   = true
-  }
-
   rule {
-    name     = "limit-requests"
+    name     = "AWS-AWSManagedRulesCommonRuleSet"
     priority = 1
 
-    action {
-      block {}
+    override_action {
+      none {}
     }
 
     statement {
-      rate_based_statement {
-        limit              = 1000
-        aggregate_key_type = "IP"
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
       }
     }
 
     visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "limitRequests"
-      sampled_requests_enabled   = true
+      cloudwatch_metrics_enabled = false
+      metric_name                = "aws-managed-common-rules"
+      sampled_requests_enabled   = false
     }
   }
-}
 
-resource "aws_cloudwatch_log_group" "waf_logs" {
-  name              = "/aws/wafv2/cloud-resume-dev"
-  retention_in_days = 7
-}
-
-resource "aws_wafv2_web_acl_logging_configuration" "website" {
-  log_destination_configs = [aws_cloudwatch_log_group.waf_logs.arn]
-  resource_arn            = aws_wafv2_web_acl.website_acl.arn
+  visibility_config {
+    cloudwatch_metrics_enabled = false
+    metric_name                = "resume-acl"
+    sampled_requests_enabled   = false
+  }
 }
 
